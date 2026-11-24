@@ -103,6 +103,14 @@ impl Clipboard {
         self.state()?.store_text(text.into())
     }
 
+    /// Starts dragging `paths` (files that exist) out of the window, to whatever the pointer
+    /// goes to: other programs get them as a `text/uri-list`. It starts from the surface that took
+    /// the latest button press, so call it while that button is down. Once the compositor takes the
+    /// drag, this window gets no more pointer events until the drag ends.
+    pub fn start_file_drag(&self, paths: &[std::path::PathBuf]) -> io::Result<()> {
+        self.state()?.start_file_drag(paths)
+    }
+
     fn state(&self) -> io::Result<Arc<crate::platform_impl::wayland::ClipboardState>> {
         self.state
             .upgrade()

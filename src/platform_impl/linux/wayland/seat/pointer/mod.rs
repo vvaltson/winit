@@ -158,6 +158,10 @@ impl PointerHandler for WinitState {
                     // Update the last button serial.
                     pointer.winit_data().inner.lock().unwrap().latest_button_serial = serial;
                     self.clipboard.note_input(&seat.id(), serial);
+                    if matches!(kind, PointerEventKind::Press { .. }) {
+                        // A drag we start must name the surface and the serial of this press.
+                        self.clipboard.note_press(&seat.id(), surface, serial);
+                    }
 
                     let button = wayland_button_to_winit(button);
                     let state = if matches!(kind, PointerEventKind::Press { .. }) {

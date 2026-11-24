@@ -8,6 +8,8 @@
 use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -19,10 +21,29 @@ use sctk::data_device_manager::WritePipe;
 use sctk::reexports::client::backend::ObjectId;
 use sctk::reexports::client::protocol::wl_data_device::WlDataDevice;
 use sctk::reexports::client::protocol::wl_data_device_manager::WlDataDeviceManager;
+use sctk::reexports::client::protocol::wl_data_device_manager::DndAction;
 use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
+use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Proxy, QueueHandle};
 
 use crate::platform_impl::wayland::state::WinitState;
+
+/// The type of a list of files, one URI to a line (RFC 2483).
+const URI_LIST: &str = "text/uri-list";
+
+/// `path` as a `file:` URI and the CRLF that ends its line in a `text/uri-list`.
+fn uri_line(path: &std::path::Path) -> String {
+    let mut line = String::from("file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+            line.push(char::from(byte));
+        } else {
+            line.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    line.push_str("\r\n");
+    line
+}
 
 /// The text types winit offers, and accepts in this order of preference.
 const TEXT_MIME_TYPES: [&str; 5] =
@@ -57,6 +78,8 @@ struct Inner {
     active_seat: Option<ObjectId>,
     /// The selection we offer, until another client takes the selection.
     owned: Option<OwnedSelection>,
+    /// The files of a drag we started, until it ends.
+    dragging: Option<OwnedDrag>,
 }
 
 #[derive(Debug)]
@@ -65,6 +88,17 @@ struct SeatClipboard {
     device: WlDataDevice,
     /// The serial of the latest input event on this seat, which setting the selection needs.
     serial: Option<u32>,
+    /// The surface that took the latest button press on this seat: where a drag starts from.
+    pressed: Option<WlSurface>,
+    /// The serial of that press: a drag must name a button's serial, not a key's.
+    press_serial: Option<u32>,
+}
+
+/// The `text/uri-list` of a drag of files we started.
+#[derive(Debug)]
+struct OwnedDrag {
+    source: WlDataSource,
+    uris: Arc<str>,
 }
 
 #[derive(Debug)]
@@ -110,7 +144,7 @@ impl ClipboardState {
     pub fn add_seat(&self, seat: ObjectId, device: WlDataDevice) {
         let mut inner = self.inner.lock().unwrap();
         inner.seats.retain(|entry| entry.seat != seat);
-        inner.seats.push(SeatClipboard { seat, device, serial: None });
+        inner.seats.push(SeatClipboard { seat, device, serial: None, pressed: None, press_serial: None });
     }
 
     pub fn remove_seat(&self, seat: &ObjectId) {
@@ -142,15 +176,29 @@ impl ClipboardState {
         if inner.owned.as_ref().is_some_and(|owned| &owned.source == source) {
             inner.owned = None;
         }
+        if inner.dragging.as_ref().is_some_and(|drag| &drag.source == source) {
+            inner.dragging = None;
+        }
         source.destroy();
     }
 
     /// Sends our selection's text through the pipe the compositor gave us.
     pub fn send(&self, source: &WlDataSource, mime_type: &str, pipe: WritePipe) {
-        let Some(text) = self.owned_text(source) else { return };
-        if !TEXT_MIME_TYPES.contains(&mime_type) && mime_type != self.marker {
-            return;
-        }
+        let dragged = {
+            let inner = self.inner.lock().unwrap();
+            inner.dragging.as_ref().filter(|drag| &drag.source == source).map(|drag| drag.uris.clone())
+        };
+        let text = match dragged {
+            Some(uris) if mime_type == URI_LIST => uris,
+            Some(_) => return,
+            None => {
+                let Some(text) = self.owned_text(source) else { return };
+                if !TEXT_MIME_TYPES.contains(&mime_type) && mime_type != self.marker {
+                    return;
+                }
+                text
+            },
+        };
         let mut file = File::from(OwnedFd::from(pipe));
         // The reader may be slow, or be this very process: write off the event loop.
         let spawned = std::thread::Builder::new().name("winit-clipboard".into()).spawn(move || {
@@ -247,6 +295,59 @@ impl ClipboardState {
         let bytes =
             read_with_timeout(File::from(OwnedFd::from(pipe)), max_bytes.min(MAX_CLIPBOARD_BYTES))?;
         Ok(((*mime).to_string(), bytes))
+    }
+
+    /// Records the surface that took a button press on a seat.
+    pub fn note_press(&self, seat: &ObjectId, surface: &WlSurface, serial: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.seats.iter_mut().find(|entry| &entry.seat == seat) {
+            entry.pressed = Some(surface.clone());
+            entry.press_serial = Some(serial);
+        }
+    }
+
+    /// Starts dragging `paths`, offered to the window under the pointer as a `text/uri-list` of
+    /// files, from the surface that took the latest button press. Only valid while that button
+    /// is still down: the compositor refuses it otherwise.
+    pub fn start_file_drag(&self, paths: &[PathBuf]) -> io::Result<()> {
+        let Some(manager) = &self.manager else {
+            return Err(io::Error::new(ErrorKind::Unsupported, "no data device manager"));
+        };
+        if paths.is_empty() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "nothing to drag"));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let Some(entry) = Self::active_device(&inner) else {
+            return Err(io::Error::new(ErrorKind::NotFound, "no seat"));
+        };
+        let (Some(serial), Some(origin)) = (entry.press_serial, entry.pressed.as_ref()) else {
+            return Err(io::Error::new(ErrorKind::Other, "no button press to start a drag for"));
+        };
+
+        let source = manager.create_data_source(&self.queue_handle, DataSourceData::default());
+        source.offer(URI_LIST.to_owned());
+        source.set_actions(DndAction::Copy);
+        entry.device.start_drag(Some(&source), origin, None, serial);
+
+        let uris: String = paths.iter().map(|path| uri_line(path)).collect();
+        if let Some(previous) = inner.dragging.replace(OwnedDrag { source, uris: uris.into() }) {
+            previous.source.destroy();
+        }
+        drop(inner);
+        // A full socket is not a failed drag: the request goes out with the next flush.
+        match self.connection.flush() {
+            Err(wayland_backend::client::WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+            result => result.map_err(|error| io::Error::new(ErrorKind::Other, error)),
+        }
+    }
+
+    /// Forgets the drag once its drop has been handled (or it was cancelled).
+    pub fn drag_ended(&self, source: &WlDataSource) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.dragging.as_ref().is_some_and(|drag| &drag.source == source) {
+            inner.dragging = None;
+            source.destroy();
+        }
     }
 
     /// Whether the other client's selection offers any of `mimes`. Nothing is requested from the
